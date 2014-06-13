@@ -9,7 +9,6 @@
 #include <ft.h>
 #include <imgstore.h>
 #include <debug.h>
-#include <unistd.h>
 
 #include "qq_types.h"
 #include "translate.h"
@@ -33,10 +32,6 @@
 #endif
 
 #define OPEN_URL(var,url) snprintf(var,sizeof(var),"xdg-open '%s'",url);
-#define LOCAL_HASH_JS(buf)  (snprintf(buf,sizeof(buf),"%s"LWQQ_PATH_SEP"hash.js",\
-			lwdb_get_config_dir()),buf)
-#define GLOBAL_HASH_JS(buf) (snprintf(buf,sizeof(buf),"%s"LWQQ_PATH_SEP"hash.js",\
-			GLOBAL_DATADIR),buf)
 
 char *qq_get_cb_real_name(PurpleConnection *gc, int id, const char *who);
 static void client_connect_signals(PurpleConnection* gc);
@@ -48,7 +43,8 @@ static void login_stage_2(LwqqAsyncEvent* ev,LwqqClient* lc);
 static void show_confirm_table(LwqqClient* lc,LwqqConfirmTable* table);
 static void qq_login(PurpleAccount *account);
 static void add_friend(LwqqClient* lc,LwqqConfirmTable* c,LwqqBuddy* b,char* message);
-static void friends_valid_hash(LwqqAsyncEvent* ev,LwqqHashFunc last_hash);
+static void friends_valid_hash(LwqqAsyncEvent* ev);
+static void show_verify_image(LwqqClient* lc,LwqqVerifyCode** p_code);
 
 enum ResetOption{
 	RESET_BUDDY=1<<0,
@@ -405,7 +401,7 @@ static void qq_add_group(PurplePluginAction* action)
 	qq_account* ac = purple_connection_get_protocol_data(gc);
 
 
-	purple_request_input(gc,_("Add QQ Group"), _("QQ Number"), NULL, NULL, FALSE, FALSE, NULL, 
+	purple_request_input(gc, _("Add QQ Group"), _("QQ Number"), NULL, NULL, FALSE, FALSE, NULL, 
 			_("Search"), G_CALLBACK(search_group), _("Cancel"), G_CALLBACK(do_no_thing), ac->account, NULL, NULL, ac);
 }
 static void create_discu(qq_account* ac,PurpleRequestFields* root)
@@ -944,6 +940,8 @@ static int group_message(LwqqClient* lc,LwqqMsgMessage* msg)
 {
 	qq_account* ac = lwqq_client_userdata(lc);
 	LwqqGroup* group;
+	static char buf[BUFLEN] ;
+	strcpy(buf,"");
 	if(msg->super.super.type == LWQQ_MS_GROUP_WEB_MSG){
 		group = find_group_by_gid(lc, msg->group_web.send);
 		if(group == NULL) return LWQQ_EC_OK;
@@ -951,17 +949,19 @@ static int group_message(LwqqClient* lc,LwqqMsgMessage* msg)
 		group = msg->group.from;
 
 		int seq = group->last_seq;
-		if(lwqq_msg_check_lost(lc, (LwqqMsg**)&msg, group)==1){
-			char lost_msg[256];
-			snprintf(lost_msg, sizeof(lost_msg), "lost message from #%d to #%d",seq+1,msg->group.seq-1);
-			qq_cgroup_got_msg(group->data, msg->group.send, PURPLE_MESSAGE_ERROR, lost_msg, time(0));
+		char lost_msg[256];
+		switch(lwqq_msg_check_lost(lc, (LwqqMsg**)&msg, group)){
+			case 1:
+				snprintf(lost_msg, sizeof(lost_msg), "lost message from #%d to #%d",seq+1,msg->group.seq-1);
+				qq_cgroup_got_msg(group->data, msg->group.send, PURPLE_MESSAGE_ERROR, lost_msg, time(0));
+				break;
+			case -1:
+				format_append(buf, "(#%d)", msg->group.seq);
+				break;
 		}
 		lwqq_msg_check_member_chg(lc, (LwqqMsg**)&msg, group);
 	}
 
-	//force open dialog
-	static char buf[BUFLEN] ;
-	strcpy(buf,"");
 
 	translate_struct_to_message(ac,msg,buf,PURPLE_MESSAGE_RECV);
 
@@ -1306,36 +1306,8 @@ static void login_stage_f(LwqqClient* lc)
 			group_come(lc,&group);
 		}
 	}
-#if 0
-	if(ac->flag & CACHE_TALKGROUP){
-		LIST_FOREACH(discu,&lc->discus,entries){
-			if(discu->last_modify==-1){
-				lwdb_userdb_insert_discu_info(ac->db, discu);
-				discu_come(lc,&discu);
-			}
-		}
-	}
-#endif
 	lwdb_userdb_commit(ac->db);
 }
-/*
-	static LwqqBuddy* create_system_buddy(LwqqClient* lc)
-	{
-	LwqqBuddy* self = lc->myself;
-	LwqqBuddy* sys = lwqq_buddy_new();
-	sys->uin = s_strdup(self->uin);
-	sys->qqnumber = s_strdup("system");
-	sys->nick = s_strdup(_("system"));
-	sys->markname = s_strdup(_("system"));
-	sys->level = 100;
-	sys->stat = LWQQ_STATUS_ONLINE;
-	sys->avatar = malloc(self->avatar_len);
-	sys->avatar_len = self->avatar_len;
-	memcpy(sys->avatar,self->avatar,self->avatar_len);
-	LIST_INSERT_HEAD(&lc->friends,sys, entries);
-	return sys;
-	}
-	*/
 
 static void login_stage_3(LwqqClient* lc)
 {
@@ -1424,28 +1396,11 @@ static void login_stage_3(LwqqClient* lc)
 	LwqqGroup* discu;
 	LIST_FOREACH(discu,&lc->discus,entries){
 		if(ac->flag&CACHE_TALKGROUP && discu->last_modify == LWQQ_LAST_MODIFY_UNKNOW)
+			// discu is imediately date, doesn't need get info from server, we can
+			// directly write it into database
 			lwdb_userdb_insert_discu_info(ac->db, &discu);
 		discu_come(lc, &discu);
 	}
-#if 0
-	if(ac->flag&CACHE_TALKGROUP){
-		LIST_FOREACH(discu,&lc->discus,entries){
-			if(!discu->account||discu->last_modify==-1){
-				ev = lwqq_info_get_discu_detail_info(lc, discu);
-				lwqq_async_evset_add_event(set, ev);
-			}
-			if(discu->last_modify!=-1){
-				discu_come(lc,&discu);
-			}
-		}
-	}else{
-		LIST_FOREACH(discu,&lc->discus,entries){
-			//discu account is always generated
-			//lwqq_override(discu->account, s_strdup(discu->did));
-			discu_come(lc, &discu);
-		}
-	}
-#endif
 
 	lwqq_async_add_evset_listener(set, _C_(p,login_stage_f,lc));
 
@@ -1494,7 +1449,6 @@ static void input_verify_image(LwqqVerifyCode* code,PurpleRequestFields* fields)
 	vp_do(code->cmd,NULL);
 }
 
-static void show_verify_image(LwqqClient* lc,LwqqVerifyCode** p_code);
 static void cancel_verify_image(LwqqVerifyCode* code,PurpleRequestField* fields)
 {
 	//valid client make sure it doesn't be freed
@@ -1527,7 +1481,7 @@ static void show_verify_image(LwqqClient* lc,LwqqVerifyCode** p_code)
 	purple_request_field_set_required(code_entry,TRUE);
 	purple_request_field_group_add_field(field_group, code_entry);
 
-	purple_request_fields(ac->account, NULL,
+	purple_request_fields(ac->gc, NULL,
 			_("Captcha"), NULL,
 			fields, _("OK"), G_CALLBACK(input_verify_image),
 			_("View Outside"), G_CALLBACK(cancel_verify_image),
@@ -1611,62 +1565,11 @@ static void flush_group_members(LwqqClient* lc,LwqqGroup** d)
 	qq_chat_group* cg = (*d)->data;
 	qq_cgroup_flush_members(cg);
 }
-#ifdef WITH_MOZJS
-static char* hash_with_local_file(const char* uin,const char* ptwebqq,void* ac_)
-{
-	char path[512] = {0};
-	lwqq_js_t* js = ((qq_account*)ac_)->js;
-	if(access(LOCAL_HASH_JS(path), F_OK)!=0)
-		if(access(GLOBAL_HASH_JS(path),F_OK)!=0)
-			return NULL;
-	lwqq_jso_t* obj = lwqq_js_load(js,path);
-	char* res = NULL;
-
-	res = lwqq_js_hash(uin, ptwebqq, js);
-	lwqq_js_unload(js, obj);
-
-	return res;
-}
-static char* hash_with_remote_file(const char* uin,const char* ptwebqq,void* ac_)
-{
-	//github.com is too slow
-	const char* url = "http://pidginlwqq.sinaapp.com/hash.js";
-	LwqqErrorCode ec = qq_download(url, "hash.js", lwdb_get_config_dir());
-	if(ec){
-		lwqq_log(LOG_ERROR,"Could not download JS From %s",url);
-	}
-	return hash_with_local_file(uin, ptwebqq, ac_);
-}
-static char* hash_with_db_url(const char* uin,const char* ptwebqq,void* ac_)
-{
-	qq_account* ac = ac_;
-	const char* url = lwdb_userdb_read(ac->db, "hash.js");
-	if(url == NULL) return NULL;
-	if(qq_download(url,"hash.js",lwdb_get_config_dir())==LWQQ_EC_ERROR) return NULL;
-	return hash_with_local_file(uin, ptwebqq, ac_);
-}
-static void get_friends_info_retry(LwqqClient* lc,LwqqHashFunc hashtry)
-{
-	LwqqAsyncEvent* ev;
-	qq_account* ac = lc->data;
-	ev = lwqq_info_get_friends_info(lc,hashtry,ac);
-	lwqq_async_add_event_listener(ev, _C_(2p,friends_valid_hash,ev,hashtry));
-}
-#endif
-static void friends_valid_hash(LwqqAsyncEvent* ev,LwqqHashFunc last_hash)
+static void friends_valid_hash(LwqqAsyncEvent* ev)
 {
 	LwqqClient* lc = ev->lc;
 	qq_account* ac = lc->data;
 	if(ev->result == LWQQ_EC_HASH_WRONG){
-#ifdef WITH_MOZJS
-		if(last_hash == hash_with_local_file){
-			get_friends_info_retry(lc, hash_with_remote_file);
-			return;
-		}else if(last_hash == hash_with_remote_file){
-			get_friends_info_retry(lc, hash_with_db_url);
-			return;
-		}
-#endif
 		purple_connection_error_reason(ac->gc, 
 				PURPLE_CONNECTION_ERROR_OTHER_ERROR, 
 #ifndef WITH_MOZJS
@@ -1684,8 +1587,10 @@ static void friends_valid_hash(LwqqAsyncEvent* ev,LwqqHashFunc last_hash)
 				_("Get Friend List Failed"));
 		return;
 	}
+	const LwqqHashEntry* succ_hash = lwqq_hash_get_last(lc);
+	lwdb_userdb_write(ac->db, "last_hash", succ_hash->name);
 	LwqqAsyncEvent* event;
-	event = lwqq_info_get_group_name_list(lc,NULL);
+	event = lwqq_info_get_group_name_list(lc, succ_hash->func, succ_hash->data);
 	lwqq_async_add_event_listener(event,_C_(2p,login_stage_2,event,lc));
 }
 static void login_stage_1(LwqqClient* lc,LwqqErrorCode* p_err)
@@ -1717,17 +1622,9 @@ static void login_stage_1(LwqqClient* lc,LwqqErrorCode* p_err)
 	gc->flags |= PURPLE_CONNECTION_HTML;
 
 
-#ifdef WITH_MOZJS
-	char path[512];
-	if(access(LOCAL_HASH_JS(path),F_OK)==0)
-		get_friends_info_retry(lc, hash_with_local_file);
-	else
-		get_friends_info_retry(lc, hash_with_remote_file);
-#else
-	LwqqAsyncEvent* ev = lwqq_info_get_friends_info(lc, lwqq_util_hashQ,NULL);
-	lwqq_async_add_event_listener(ev, _C_(2p,friends_valid_hash,ev,lwqq_util_hashQ));
-#endif
-
+	// use lwqq 0.3.1 hash auto select api
+	LwqqAsyncEvent* ev = lwqq_info_get_friends_info(lc, NULL, NULL);
+	lwqq_async_add_event_listener(ev, _C_(p,friends_valid_hash,ev));
 	return ;
 }
 static void login_stage_2(LwqqAsyncEvent* event,LwqqClient* lc)
@@ -1759,14 +1656,13 @@ static void login_stage_2(LwqqAsyncEvent* event,LwqqClient* lc)
 //send back receipt
 static void send_receipt(LwqqAsyncEvent* ev,LwqqMsg* msg,char* serv_id,char* what,long retry)
 {
-	if(lwqq_async_event_get_code(ev)==LWQQ_CALLBACK_FAILED) goto failed;
 	qq_account* ac = lwqq_async_event_get_owner(ev)->data;
 	LwqqMsgMessage* mmsg = (LwqqMsgMessage*)msg;
 
 	if(ev == NULL){
 		qq_sys_msg_write(ac,msg->type,serv_id,_("Message body too long"),PURPLE_MESSAGE_ERROR,time(NULL));
 	}else{
-		int err = lwqq_async_event_get_result(ev);
+		int err = ev->result;
 		static char buf[1024]={0};
 		PurpleConversation* conv = find_conversation(msg->type,serv_id,ac);
 
@@ -1778,8 +1674,8 @@ static void send_receipt(LwqqAsyncEvent* ev,LwqqMsg* msg,char* serv_id,char* wha
 			return;
 		}
 
-		if(conv && err > 0){
-			snprintf(buf,sizeof(buf),_("Send failed, err:%d:\n%s"),err,what);
+		if(conv && err != 0){
+			snprintf(buf,sizeof(buf),_("Send failed, err(%d):\n%s"),err,what);
 			qq_sys_msg_write(ac, msg->type, serv_id, buf, PURPLE_MESSAGE_ERROR, time(NULL));
 		}
 	}
@@ -1788,7 +1684,7 @@ static void send_receipt(LwqqAsyncEvent* ev,LwqqMsg* msg,char* serv_id,char* wha
 
 	if(msg->type == LWQQ_MS_GROUP_MSG) mmsg->group.group_code = NULL;
 	else if(msg->type == LWQQ_MS_DISCU_MSG) mmsg->discu.did = NULL;
-failed:
+
 	s_free(what);
 	s_free(serv_id);
 	lwqq_msg_free(msg);
@@ -2830,22 +2726,13 @@ static GList* qq_blist_node_menu(PurpleBlistNode* node)
 }
 static void client_connect_signals(PurpleConnection* gc)
 {
+	static int handle;
+	void *h = &handle;
+
+	purple_signal_connect(purple_conversations_get_handle(),
+			"conversation-created", h,
+			PURPLE_CALLBACK(translate_add_smiley_to_conversation), NULL);
 }
-#if 0
-static const char* qq_list_emblem(PurpleBuddy* b)
-{
-	LwqqBuddy* buddy = b->proto_data;
-	const char* ret = NULL;
-	switch(buddy->client_type){
-		case LWQQ_CLIENT_WEBQQ:
-			ret = "external";
-			break;
-		default:
-			break;
-	}
-	return ret;
-}
-#endif
 
 static void display_user_info(PurpleConnection* gc,LwqqBuddy* b,char *who)
 {
@@ -2900,8 +2787,13 @@ static void qq_get_user_info(PurpleConnection* gc,const char* who)
 	else 
 		buddy = lc->find_buddy_by_uin(lc,who);
 	if(buddy){
-		LwqqAsyncEvent* ev = lwqq_info_get_friend_detail_info(lc, buddy);
-		lwqq_async_add_event_listener(ev, _C_(3p,display_user_info,gc,buddy,NULL));
+		LwqqAsyncEvset* set = lwqq_async_evset_new();
+		LwqqAsyncEvent* ev = NULL;
+		ev = lwqq_info_get_single_long_nick(lc, buddy);
+		lwqq_async_evset_add_event(set, ev);
+		ev = lwqq_info_get_friend_detail_info(lc, buddy);
+		lwqq_async_evset_add_event(set, ev);
+		lwqq_async_add_evset_listener(set, _C_(3p,display_user_info,gc,buddy,NULL));
 	}else{
 		// Not a buddy? try fetch stranger info
 		LwqqGroup* g = NULL;
@@ -3035,8 +2927,9 @@ init_plugin(PurplePlugin *plugin)
 	options = g_list_append(options, option);
 	option = purple_account_option_bool_new(_("SSL(encrypt on chat)"), "ssl", FALSE);
 	options = g_list_append(options,option);
-	option = purple_account_option_bool_new(_("Remove Duplicated Message"),"remove_duplicated_msg",FALSE);
-	options = g_list_append(options, option);
+	// disable duplicated message, it seems no use
+	// option = purple_account_option_bool_new(_("Remove Duplicated Message"),"remove_duplicated_msg",FALSE);
+	// options = g_list_append(options, option);
 	option = purple_account_option_bool_new(_("Don't Download Group Pic(Reduce Network Transfer)"), "no_download_group_pic", FALSE);
 	options = g_list_append(options,option);
 	option = purple_account_option_bool_new(_("Version Statics"), "version_statics", TRUE);
@@ -3177,7 +3070,7 @@ static void qq_login(PurpleAccount *account)
 	lwqq_bit_set(ac->flag, QQ_DONT_EXPECT_100_CONTINUE,purple_account_get_bool(account,"dont_expected_100_continue",FALSE));
 	lwqq_bit_set(ac->flag, NOT_DOWNLOAD_GROUP_PIC, purple_account_get_bool(account, "no_download_group_pic", FALSE));
 	lwqq_bit_set(ac->flag, SEND_VISUALBILITY, purple_account_get_bool(account, "send_visualbility", SEND_VISUAL_DEFAULT));
-	lwqq_bit_set(ac->flag, CACHE_TALKGROUP, purple_account_get_bool(account, "cache_talk", FALSE));
+	lwqq_bit_set(ac->flag, CACHE_TALKGROUP, purple_account_get_bool(account, "cache_talk", TRUE));
 	ac->recent_group_name = s_strdup(purple_account_get_string(account, "recent_group_name", "Recent Contacts"));
 	lwqq_get_http_handle(ac->qq)->ssl = purple_account_get_bool(account, "ssl", FALSE);
 	int relink_retry = 0;
@@ -3198,6 +3091,9 @@ static void qq_login(PurpleAccount *account)
 		lwqq_override(ac->font.family,s_strdup(lwdb_userdb_read(ac->db, "f_family")));
 		ac->font.size = s_atoi(lwdb_userdb_read(ac->db,"f_size"),ac->font.size);
 		ac->font.style = s_atoi(lwdb_userdb_read(ac->db,"f_style"),ac->font.style);
+
+		const char* last_hash = lwdb_userdb_read(ac->db, "last_hash");
+		if(last_hash) lwqq_hash_set_beg(ac->qq, last_hash);
 	}
 
 
