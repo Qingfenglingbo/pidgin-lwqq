@@ -1308,6 +1308,7 @@ static void login_stage_f(LwqqClient* lc)
 	}
 	lwdb_userdb_commit(ac->db);
 
+	// wait all download finished, start msg pool, to get all qqnumber
 	LwqqPollOption flags = POLL_AUTO_DOWN_DISCU_PIC|POLL_AUTO_DOWN_GROUP_PIC|POLL_AUTO_DOWN_BUDDY_PIC;
 	if(ac->flag& REMOVE_DUPLICATED_MSG)
 		flags |= POLL_REMOVE_DUPLICATED_MSG;
@@ -1315,6 +1316,9 @@ static void login_stage_f(LwqqClient* lc)
 		flags &= ~POLL_AUTO_DOWN_GROUP_PIC;
 
 	lwqq_msglist_poll(lc->msg_list, flags);
+
+	// now open status, allow user start talk
+	ac->state = LOAD_COMPLETED;
 }
 
 static void login_stage_3(LwqqClient* lc)
@@ -1412,8 +1416,6 @@ static void login_stage_3(LwqqClient* lc)
 
 	lwqq_async_add_evset_listener(set, _C_(p,login_stage_f,lc));
 
-
-	ac->state = LOAD_COMPLETED;
 }
 
 static void upload_content_fail(LwqqClient* lc,const char** p_serv_id,LwqqMsgContent** p_c,int* p_err)
@@ -1653,42 +1655,48 @@ static void login_stage_2(LwqqAsyncEvent* event,LwqqClient* lc)
 	lwqq_async_add_evset_listener(set,_C_(p,login_stage_3,lc));
 }
 
+static void msg_unsend_print_reason(qq_account* ac, LwqqMsg* msg, const char* serv_id)
+{
+	qq_sys_msg_write(ac, msg->type, serv_id, _("unable send message"), PURPLE_MESSAGE_ERROR, time(0));
+}
+
 //send back receipt
 static void send_receipt(LwqqAsyncEvent* ev,LwqqMsg* msg,char* serv_id,char* what,long retry)
 {
-	qq_account* ac = lwqq_async_event_get_owner(ev)->data;
 	LwqqMsgMessage* mmsg = (LwqqMsgMessage*)msg;
+	if(ev == NULL) goto done;
 
-	if(ev == NULL){
-		qq_sys_msg_write(ac,msg->type,serv_id,_("Message body too long"),PURPLE_MESSAGE_ERROR,time(NULL));
-	}else{
-		int err = ev->result;
-		static char buf[1024]={0};
-		PurpleConversation* conv = find_conversation(msg->type,serv_id,ac);
+	qq_account* ac = ev->lc->data;
+	int err = ev->result;
+	static char buf[1024]={0};
+	PurpleConversation* conv = find_conversation(msg->type,serv_id,ac);
 
-		if(err == LWQQ_EC_LOST_CONN){
-			vp_do_repeat(ac->qq->events->poll_lost, NULL);
-		}else if(err == 108 && retry>0) {
-			LwqqAsyncEvent* event = lwqq_msg_send(ac->qq, mmsg);
-			lwqq_async_add_event_listener(event, _C_(4pl,send_receipt,event, msg, serv_id, what,retry-1));
-			return;
-		}
-
-		if(conv && err != 0){
-			snprintf(buf,sizeof(buf),_("Send failed, err(%d):\n%s"),err,what);
-			qq_sys_msg_write(ac, msg->type, serv_id, buf, PURPLE_MESSAGE_ERROR, time(NULL));
-		}
+	if(err == LWQQ_EC_LOST_CONN){
+		vp_do_repeat(ac->qq->events->poll_lost, NULL);
+	}else if(err == 108 && retry>0) {
+		LwqqAsyncEvent* event = lwqq_msg_send(ac->qq, mmsg);
+		if(!event) msg_unsend_print_reason(ac, msg, serv_id);
+		lwqq_async_add_event_listener(event, _C_(4pl,send_receipt,event, msg, serv_id, what,retry-1));
+		return;
 	}
+
+	if(conv && err != 0){
+		snprintf(buf,sizeof(buf),_("Send failed, err(%d):\n%s"),err,what);
+		qq_sys_msg_write(ac, msg->type, serv_id, buf, PURPLE_MESSAGE_ERROR, time(NULL));
+	}
+
 	if(mmsg->upload_retry <0)
 		qq_sys_msg_write(ac, msg->type, serv_id, _("Upload content retry over limit"), PURPLE_MESSAGE_ERROR, time(NULL));
 
 	if(msg->type == LWQQ_MS_GROUP_MSG) mmsg->group.group_code = NULL;
 	else if(msg->type == LWQQ_MS_DISCU_MSG) mmsg->discu.did = NULL;
 
+done:
 	s_free(what);
 	s_free(serv_id);
 	lwqq_msg_free(msg);
 }
+
 
 //send a message to a friend.
 //called by purple
@@ -1749,6 +1757,7 @@ static int qq_send_im(PurpleConnection *gc, const gchar *who, const gchar *what,
 	}
 
 	LwqqAsyncEvent* ev = lwqq_msg_send(lc,mmsg);
+	if(!ev) msg_unsend_print_reason(ac, msg, who);
 	lwqq_async_add_event_listener(ev,_C_(4pl, send_receipt,ev,msg,strdup(who),strdup(what),2L));
 
 	return !send_visual;
@@ -1779,6 +1788,7 @@ static int qq_send_chat(PurpleConnection *gc, int id, const char *message, Purpl
 	translate_message_to_struct(ac->qq, group->gid, message, msg, 1);
 
 	LwqqAsyncEvent* ev = lwqq_msg_send(ac->qq,mmsg);
+	if(!ev) msg_unsend_print_reason(ac, msg, group->gid);
 	lwqq_async_add_event_listener(ev, _C_(4pl,send_receipt,ev,msg,s_strdup(group->gid),s_strdup(message),2L));
 #ifndef APPLE
 	//in adium it would automatic type send message
@@ -1798,45 +1808,6 @@ static unsigned int qq_send_typing(PurpleConnection* gc,const char* local_id,Pur
 	return 0;
 }
 
-#if 0
-static void qq_leave_chat(PurpleConnection* gc,int id)
-{
-	printf("leave chat\n");
-}
-
-//pidgin not use send_whisper .
-//may use it in v 3.0.0
-static void qq_send_whisper(PurpleConnection* gc,int id,const char* who,const char* message)
-{
-	qq_account* ac = (qq_account*)purple_connection_get_protocol_data(gc);
-	LwqqClient* lc = ac->qq;
-	LwqqGroup* group = opend_chat_index(ac,id);
-
-	LwqqBuddy* buddy = find_buddy_by_uin(lc,who);
-	if(buddy!=NULL) {
-		qq_send_im(gc,who,message,PURPLE_MESSAGE_WHISPER);
-		return;
-	}
-
-	LwqqSimpleBuddy* sb = find_group_member_by_nick(group,who);
-	if(sb==NULL)
-		return;
-
-	LwqqMsg* msg = lwqq_msg_new(LWQQ_MT_SESS_MSG);
-	LwqqMsgMessage *mmsg = msg->opaque;
-	mmsg->to = sb->uin;
-	if(!sb->group_sig)
-		lwqq_info_get_group_sig(lc,group,sb->uin);
-	mmsg->group_sig = sb->group_sig;
-	mmsg->f_name = "宋体";
-	mmsg->f_size = 13;
-	mmsg->f_style.b = 0,mmsg->f_style.i = 0,mmsg->f_style.u = 0;
-	mmsg->f_color = "000000";
-
-	lwqq_msg_send(lc,msg);
-
-}
-#endif
 
 GList *qq_chat_info(PurpleConnection *gc)
 {
