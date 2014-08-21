@@ -703,14 +703,12 @@ static void buddy_message(LwqqClient* lc,LwqqMsgMessage* msg)
 {
 	qq_account* ac = lwqq_client_userdata(lc);
 	PurpleConnection* pc = ac->gc;
-	char buf[BUFLEN]={0};
-	//clean buffer
-	strcpy(buf,"");
 	LwqqBuddy* buddy = msg->buddy.from;
 	const char* local_id = (ac->flag&QQ_USE_QQNUM)?buddy->qqnumber:buddy->uin;
 
-	translate_struct_to_message(ac,msg,buf,PURPLE_MESSAGE_RECV);
-	serv_got_im(pc, local_id, buf, PURPLE_MESSAGE_RECV, msg->time);
+	struct ds body = translate_struct_to_message(ac,msg,PURPLE_MESSAGE_RECV);
+	serv_got_im(pc, local_id, ds_c_str(body), PURPLE_MESSAGE_RECV, msg->time);
+	ds_free(body);
 }
 static void offline_file(LwqqClient* lc,LwqqMsgOffFile* msg)
 {
@@ -857,7 +855,7 @@ struct rewrite_pic_entry {
 };
 static void rewrite_whole_message_list(LwqqAsyncEvent* ev,qq_account* ac,LwqqGroup* group)
 {
-	if(lwqq_async_event_get_code(ev)==LWQQ_CALLBACK_FAILED) return;
+	if(ev->result != LWQQ_EC_OK) return;
 	qq_chat_group* cg = group->data;
 	qq_cgroup_flush_members(cg);
 
@@ -940,8 +938,9 @@ static int group_message(LwqqClient* lc,LwqqMsgMessage* msg)
 {
 	qq_account* ac = lwqq_client_userdata(lc);
 	LwqqGroup* group;
-	static char buf[BUFLEN] ;
-	strcpy(buf,"");
+	char piece[8192];
+	struct ds buf = ds_initializer, body = ds_initializer;
+	ds_sure(buf, BUFLEN);
 	if(msg->super.super.type == LWQQ_MS_GROUP_WEB_MSG){
 		group = find_group_by_gid(lc, msg->group_web.send);
 		if(group == NULL) return LWQQ_EC_OK;
@@ -956,17 +955,19 @@ static int group_message(LwqqClient* lc,LwqqMsgMessage* msg)
 				qq_cgroup_got_msg(group->data, msg->group.send, PURPLE_MESSAGE_ERROR, lost_msg, time(0));
 				break;
 			case -1:
-				format_append(buf, "(#%d)", msg->group.seq);
+				snprintf(piece, sizeof(piece), "(#%d)", msg->group.seq);
+				ds_cat(buf, piece);
 				break;
 		}
 		lwqq_msg_check_member_chg(lc, (LwqqMsg**)&msg, group);
 	}
 
 
-	translate_struct_to_message(ac,msg,buf,PURPLE_MESSAGE_RECV);
+	body = translate_struct_to_message(ac,msg,PURPLE_MESSAGE_RECV);
+	ds_cat(buf, ds_c_str(body));
 
 	if(LIST_EMPTY(&group->members)) {
-		const char* pic = buf;
+		const char* pic = ds_c_str(buf);
 		while((pic = strstr(pic,"<IMG"))!=NULL){
 			int id;
 			sscanf(pic, "<IMG ID=\"%d\">",&id);
@@ -992,7 +993,9 @@ static int group_message(LwqqClient* lc,LwqqMsgMessage* msg)
 		}
 	}//else set user list in cgroup_got_msg
 
-	qq_cgroup_got_msg(group->data, msg->group.send, PURPLE_MESSAGE_RECV, buf, msg->time);
+	qq_cgroup_got_msg(group->data, msg->group.send, PURPLE_MESSAGE_RECV, ds_c_str(buf), msg->time);
+	ds_free(buf);
+	ds_free(body);
 	return LWQQ_EC_OK;
 }
 static void whisper_message(LwqqClient* lc,LwqqMsgMessage* mmsg)
@@ -1003,19 +1006,20 @@ static void whisper_message(LwqqClient* lc,LwqqMsgMessage* mmsg)
 	const char* from = mmsg->super.from;
 	const char* gid = mmsg->sess.id;
 	char name[70]={0};
-	static char buf[BUFLEN]={0};
-	strcpy(buf,"");
+	struct ds buf = ds_initializer;
 
-	translate_struct_to_message(ac,mmsg,buf,PURPLE_MESSAGE_RECV);
+	buf = translate_struct_to_message(ac,mmsg,PURPLE_MESSAGE_RECV);
 
 	LwqqGroup* group = find_group_by_gid(lc,gid);
 	if(group == NULL) {
 		snprintf(name,sizeof(name),"%s #(broken)# %s",from,gid);
-		serv_got_im(pc,name,buf,PURPLE_MESSAGE_RECV,mmsg->time);
+		serv_got_im(pc,name,ds_c_str(buf),PURPLE_MESSAGE_RECV,mmsg->time);
+		ds_free(buf);
 		return;
 	}
 
-	LwqqCommand cmd = _C_(4pl,whisper_message_delay_display,ac,group,s_strdup(from),s_strdup(buf),mmsg->time);
+	LwqqCommand cmd = _C_(4pl,whisper_message_delay_display,ac,group,s_strdup(from),s_strdup(ds_c_str(buf)),mmsg->time);
+	ds_free(buf);
 	if(LIST_EMPTY(&group->members)) {
 		lwqq_async_add_event_listener(lwqq_info_get_group_detail_info(lc,group,NULL),cmd);
 	} else
@@ -1160,7 +1164,7 @@ static void friend_avatar(qq_account* ac,LwqqBuddy* buddy)
 }
 static void group_avatar(LwqqAsyncEvent* ev,LwqqGroup* group)
 {
-	qq_account* ac = lwqq_async_event_get_owner(ev)->data;
+	qq_account* ac = ev->lc->data;
 
 	PurpleAccount* account = ac->account;
 	PurpleChat* chat;
@@ -1448,7 +1452,7 @@ static void input_verify_image(LwqqVerifyCode* code,PurpleRequestFields* fields)
 	value = purple_request_fields_get_string(fields, "code_entry");
 	code->str = s_strdup(value);
 
-	vp_do(code->cmd,NULL);
+	vp_do(code->cmd, NULL);
 }
 
 static void cancel_verify_image(LwqqVerifyCode* code,PurpleRequestField* fields)
@@ -1456,11 +1460,14 @@ static void cancel_verify_image(LwqqVerifyCode* code,PurpleRequestField* fields)
 	//valid client make sure it doesn't be freed
 	LwqqClient* lc = code->lc;
 	if(!lwqq_client_valid(lc)) return;
-	lwqq_util_save_img(code->data, code->size, lc->username,LWQQ_CACHE_DIR);
-	char cmd[512];
-	snprintf(cmd,sizeof(cmd),OPEN_PROG" '%s/%s'",LWQQ_CACHE_DIR,lc->username);
-	system(cmd);
-	show_verify_image(lc, &code);
+	if(CAPTCHA_VIEW_OUTSIDE){
+		lwqq_util_save_img(code->data, code->size, lc->username,LWQQ_CACHE_DIR);
+		char cmd[512];
+		snprintf(cmd,sizeof(cmd),OPEN_PROG" '%s/%s'",LWQQ_CACHE_DIR,lc->username);
+		system(cmd);
+		show_verify_image(lc, &code);
+	}else
+		vp_do(code->cmd, NULL);
 }
 
 static void show_verify_image(LwqqClient* lc,LwqqVerifyCode** p_code)
@@ -1483,10 +1490,12 @@ static void show_verify_image(LwqqClient* lc,LwqqVerifyCode** p_code)
 	purple_request_field_set_required(code_entry,TRUE);
 	purple_request_field_group_add_field(field_group, code_entry);
 
+
 	purple_request_fields(ac->gc, NULL,
 			_("Captcha"), NULL,
 			fields, _("OK"), G_CALLBACK(input_verify_image),
-			_("View Outside"), G_CALLBACK(cancel_verify_image),
+			(CAPTCHA_VIEW_OUTSIDE)?_("View Outside"):_("Cancel"), 
+			G_CALLBACK(cancel_verify_image),
 			ac->account, NULL, NULL, code);
 
 	return ;
@@ -1591,8 +1600,7 @@ static void friends_valid_hash(LwqqAsyncEvent* ev)
 	}
 	const LwqqHashEntry* succ_hash = lwqq_hash_get_last(lc);
 	lwdb_userdb_write(ac->db, "last_hash", succ_hash->name);
-	LwqqAsyncEvent* event;
-	event = lwqq_info_get_group_name_list(lc, succ_hash->func, succ_hash->data);
+	LwqqAsyncEvent* event = lwqq_info_get_group_name_list(lc, NULL, NULL);
 	lwqq_async_add_event_listener(event,_C_(2p,login_stage_2,event,lc));
 }
 static void login_stage_1(LwqqClient* lc,LwqqErrorCode* p_err)
@@ -1749,11 +1757,12 @@ static int qq_send_im(PurpleConnection *gc, const gchar *who, const gchar *what,
 	strcpy(mmsg->f_color,"000000");
 
 	translate_message_to_struct(lc, who, what, msg, 1);
+
 	if(send_visual){
-		char whatsnew[1024*10] = {0};
-		translate_struct_to_message(ac, mmsg, whatsnew,PURPLE_MESSAGE_SEND);
+		struct ds whatsnew = translate_struct_to_message(ac, mmsg, PURPLE_MESSAGE_SEND);
 		PurpleConversation* conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_IM, who, ac->account);
-		purple_conversation_write(conv, NULL, whatsnew, flags, time(NULL));
+		purple_conversation_write(conv, NULL, ds_c_str(whatsnew), flags, time(NULL));
+		ds_free(whatsnew);
 	}
 
 	LwqqAsyncEvent* ev = lwqq_msg_send(lc,mmsg);
@@ -1952,11 +1961,11 @@ static void on_create(void *data,PurpleConnection* gc)
 static void qq_close(PurpleConnection *gc)
 {
 	qq_account* ac = purple_connection_get_protocol_data(gc);
-	LwqqErrorCode err;
+	if(!ac) return;
 
 	if(ac->relink_timer>0) purple_timeout_remove(ac->relink_timer);
 	if(lwqq_client_logined(ac->qq))
-		lwqq_logout(ac->qq,&err);
+		lwqq_logout(ac->qq, 3);// only wait 3 seconds to logout
 	lwqq_msglist_close(ac->qq->msg_list);
 	LwqqGroup* g;
 	LIST_FOREACH(g,&ac->qq->groups,entries){
@@ -1968,7 +1977,7 @@ static void qq_close(PurpleConnection *gc)
 	translate_global_free();
 	g_ref_count -- ;
 	if(g_ref_count == 0){
-		lwqq_http_global_free();
+		lwqq_http_global_free(LWQQ_CLEANUP_IGNORE);
 		lwqq_async_global_quit();
 		lwdb_global_free();
 	}
@@ -2002,7 +2011,7 @@ static void change_category_back(LwqqAsyncEvent* event,void* data)
 	void**d = data;
 	qq_account* ac = d[2];
 	if(event == NULL) goto clean;
-	if(lwqq_async_event_get_result(event)!=0) {
+	if(event->result!=LWQQ_EC_OK) {
 		move_buddy_back(data);
 		purple_notify_error(ac->gc,NULL,_("Change friend category failed"),_("Server fault returns"));
 		return;
@@ -3022,13 +3031,19 @@ static void qq_login(PurpleAccount *account)
 {
 
 	PurpleConnection* pc= purple_account_get_connection(account);
-	qq_account* ac = qq_account_new(account);
 	const char* username = purple_account_get_username(account);
 	const char* password = purple_account_get_password(account);
 	if(password==NULL||strcmp(password,"")==0) {
 		purple_connection_error_reason(pc,PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED,_("Password is empty"));
 		return;
 	}
+	if(strcmp(lwqq_version,VERSION)!=0){
+		char buf[256];
+		snprintf(buf, sizeof(buf), _("lwqq version didn't match, found %s, require %s"), lwqq_version, VERSION);
+		purple_connection_error_reason(pc, PURPLE_CONNECTION_ERROR_OTHER_ERROR, buf);
+		return;
+	}
+	qq_account* ac = qq_account_new(account);
 	g_ref_count ++ ;
 	ac->gc = pc;
 	init_client_events(ac->qq);
