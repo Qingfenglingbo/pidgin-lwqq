@@ -6,7 +6,6 @@
 #define PACKAGE "@package@"
 #define LOCALEDIR "@localedir@"
 #define GETTEXT_PACKAGE "@package@"
-#define GLOBAL_DATADIR "@datadir@"
 #define VERSION "@version@"
 
 #cmakedefine OPEN_PROG "@OPEN_PROG@"
@@ -15,6 +14,8 @@
 #define QQ_USE_FAST_INDEX 1
 // captcha button is View OutSide Or Cancel
 #define CAPTCHA_VIEW_OUTSIDE 0
+// mask group in local database
+#define QQ_LOCAL_MASK 1
 
 #endif /* __CONFIG_H__ */
 
