@@ -76,7 +76,6 @@ typedef struct qq_account {
 		QQ_DONT_EXPECT_100_CONTINUE = 1<<6,
 		NOT_DOWNLOAD_GROUP_PIC = 1<<7,
 		SEND_VISUALBILITY = 1<<8,
-		CACHE_TALKGROUP = 1<<9,
 	}flag;
 #if QQ_USE_FAST_INDEX
 	struct{
@@ -111,11 +110,13 @@ void qq_account_remove_index_node(qq_account* ac,const LwqqBuddy* b,const LwqqGr
 void qq_sys_msg_write(qq_account* ac,LwqqMsgType m_t,const char* serv_id,const char* msg,PurpleMessageFlags type,time_t t);
 void qq_system_log(qq_account* ac,const char* log);
 
+#if 0
 //----------------------------ft.h-----------------------------
 void file_message(LwqqClient* lc,LwqqMsgFileMessage* file);
 void qq_send_file(PurpleConnection* gc,const char* who,const char* filename);
 void qq_send_offline_file(PurpleBlistNode* node);
 //=============================================================
+#endif
 
 LwqqBuddy* find_buddy_by_qqnumber(LwqqClient* lc,const char* qqnum);
 LwqqBuddy* find_buddy_by_uin(LwqqClient* lc,const char* uin);

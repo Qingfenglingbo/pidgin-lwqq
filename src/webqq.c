@@ -685,6 +685,7 @@ static void group_come(LwqqClient* lc,LwqqGroup** p_group)
 		group->data = cg;
 		cg->group = group;
 		cg->chat = chat;
+		cg->mask_local = group->mask;
 	}
 
 	if(lwqq_group_is_qun(group)){
@@ -1246,9 +1247,9 @@ void qq_msg_check(LwqqClient* lc)
 				case LWQQ_MT_OFFFILE:
 					offline_file(lc,(LwqqMsgOffFile*)msg->msg);
 					break;
-				case LWQQ_MT_FILE_MSG:
+				/*case LWQQ_MT_FILE_MSG:
 					file_message(lc,(LwqqMsgFileMessage*)msg->msg);
-					break;
+					break;*/
 				case LWQQ_MT_FILETRANS:
 					//complete_file_trans(lc,(LwqqMsgFileTrans*)msg->msg->opaque);
 					break;
@@ -1377,7 +1378,7 @@ static void login_stage_3(LwqqClient* lc)
 	}
 
 	//clean extra duplicated node
-	all_reset(ac,RESET_GROUP_SOFT|(ac->flag&CACHE_TALKGROUP?RESET_DISCU_SOFT:RESET_DISCU));
+	all_reset(ac,RESET_GROUP_SOFT|RESET_DISCU_SOFT);
 
 	LwqqAsyncEvset* qq_pool = lwqq_async_evset_new();
 	LwqqAsyncEvset* info_pool = lwqq_async_evset_new();
@@ -1426,7 +1427,7 @@ static void login_stage_3(LwqqClient* lc)
 
 	LwqqGroup* discu;
 	LIST_FOREACH(discu,&lc->discus,entries){
-		if(ac->flag&CACHE_TALKGROUP && discu->last_modify == LWQQ_LAST_MODIFY_UNKNOW)
+		if(discu->last_modify == LWQQ_LAST_MODIFY_UNKNOW)
 			// discu is imediately date, doesn't need get info from server, we can
 			// directly write it into database
 			lwdb_userdb_insert_discu_info(ac->db, &discu);
@@ -2350,9 +2351,14 @@ static LwqqGroup* find_group_by_chat(PurpleChat* chat)
 static void set_cgroup_block(LwqqConfirmTable* ct,LwqqClient* lc,LwqqGroup* g)
 {
 	if(ct->answer != LWQQ_IGNORE){
+#ifdef QQ_LOCAL_MASK
+		qq_cgroup_mask_local(g->data, ct->answer);
+		qq_set_group_name(g->data);
+#else
 		lwqq_async_add_event_listener(
 				lwqq_info_mask_group(lc,g,ct->answer),
 				_C_(p,qq_set_group_name,g->data));
+#endif
 	}
 	lwqq_ct_free(ct);
 }
@@ -2490,6 +2496,10 @@ static void display_group_info(qq_account* ac,LwqqGroup* g)
 	//ADD_STRING("创建时间",ctime(&g->createtime));
 	purple_notify_userinfo(ac->gc, g->account, info, (PurpleNotifyCloseCallback)purple_notify_user_info_destroy, info);
 #undef ADD_STRING
+#ifdef QQ_LOCAL_MASK
+	qq_chat_group* cg = g->data;
+	g->mask = cg->mask_local;
+#endif
 	lwdb_userdb_update_group_info(ac->db, &g);
 }
 
@@ -2931,8 +2941,6 @@ init_plugin(PurplePlugin *plugin)
 	options = g_list_append(options, option);
 	option = purple_account_option_bool_new(_("What you seen Is What you send"), "send_visualbility", SEND_VISUAL_DEFAULT);
 	options = g_list_append(options, option);
-	option = purple_account_option_bool_new(_("Cache Talk Group"),"cache_talk", TRUE);
-	options = g_list_append(options, option);
 #if 0 | DISABLED_AREA
 	option = purple_account_option_bool_new(_("Do not use Expected:100 Continue when send offline message"),"dont_expected_100_continue",FALSE);
 	options = g_list_append(options, option);
@@ -3071,7 +3079,6 @@ static void qq_login(PurpleAccount *account)
 	lwqq_bit_set(ac->flag, QQ_DONT_EXPECT_100_CONTINUE,purple_account_get_bool(account,"dont_expected_100_continue",FALSE));
 	lwqq_bit_set(ac->flag, NOT_DOWNLOAD_GROUP_PIC, purple_account_get_bool(account, "no_download_group_pic", FALSE));
 	lwqq_bit_set(ac->flag, SEND_VISUALBILITY, purple_account_get_bool(account, "send_visualbility", SEND_VISUAL_DEFAULT));
-	lwqq_bit_set(ac->flag, CACHE_TALKGROUP, purple_account_get_bool(account, "cache_talk", TRUE));
 	ac->recent_group_name = s_strdup(purple_account_get_string(account, "recent_group_name", "Recent Contacts"));
 	lwqq_get_http_handle(ac->qq)->ssl = purple_account_get_bool(account, "ssl", FALSE);
 	int relink_retry = 0;
